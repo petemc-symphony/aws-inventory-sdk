@@ -62,7 +62,7 @@ The `query` subcommand allows you to filter and view the collected data. By defa
 **Examples:**
 
 ```sh
-# Get all EC2 instances and RDS databases across all scanned regions, output text rather than the default json
+# Get all EC2 instances and RDS databases across all scanned regions, output text
 ./aws-inventory-sdk-macos-arm64 query --services ec2,rds --text
 
 # Get all EKS pods in the us-east-1 region

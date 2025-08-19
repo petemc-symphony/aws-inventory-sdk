@@ -29,7 +29,7 @@ You can use the `build.sh` script to create binaries for macOS (ARM) and Linux (
 ```sh
 ./build.sh
 ```
-The binaries will be placed in the `dist/` directory.
+The binaries will be placed in the `dist/` directory. Prebuilt binaries can also be downloaded from there
 
 ## Usage
 

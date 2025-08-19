@@ -38,6 +38,12 @@ All commands are run via the `aws-inventory-sdk` binary.
 ### 1. Create the Inventory Database
 
 First, you need to populate the local database with your AWS resource data.
+It is recommended to have a directory for each profile so it uses a separate db
+
+```sh
+mkdir -p ~/inv/{dev,qa,prod}
+cp the binary to each dir and use from there
+```
 
 ```sh
 # Scan all available regions for the specified profile

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use aws_inventory_sdk::{config, export, identify, inventory};
+use aws_inventory_sdk::{config, export, identify, inventory, server};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use structopt::StructOpt;
@@ -27,6 +27,19 @@ enum Opt {
         #[structopt(long, use_delimiter = true, help = "Specific EKS clusters to scan (optional)")]
         eks_clusters: Vec<String>,
     },
+    Query {
+        #[structopt(long, default_value = "aws_inventory.db")]
+        inventory: PathBuf,
+
+        #[structopt(long, short, use_delimiter = true)]
+        services: Vec<String>,
+
+        #[structopt(long, short, use_delimiter = true)]
+        regions: Vec<String>,
+
+        #[structopt(long)]
+        text: bool,
+    },
     Identify {
         #[structopt(long, default_value = "aws_inventory.db")]
         inventory: PathBuf,
@@ -41,7 +54,16 @@ enum Opt {
         #[structopt(long, short, default_value = "hosts.txt")]
         output: PathBuf,
     },
+    Serve {
+        #[structopt(long, default_value = "aws_inventory.db")]
+        inventory: PathBuf,
 
+        #[structopt(long, default_value = "127.0.0.1:8080", help = "Address to listen on")]
+        listen: String,
+
+        #[structopt(long, help = "Do not open the web browser automatically")]
+        no_browser: bool,
+    },
 }
 
 #[tokio::main]
@@ -78,6 +100,9 @@ async fn main() -> Result<()> {
             let collectors: Vec<Box<dyn inventory::AwsResourceCollector>> = vec![
                 Box::new(inventory::Ec2Collector),
                 Box::new(inventory::ElbCollector),
+                Box::new(inventory::RdsCollector),
+                Box::new(inventory::DynamoDbCollector),
+                Box::new(inventory::ElastiCacheCollector),
                 Box::new(eks_collector),
             ];
 
@@ -109,7 +134,22 @@ async fn main() -> Result<()> {
             export::to_hosts_file_from_db(&inventory, &output)?;
             println!("Hosts file exported to {:?}", output);
         }
-
+        Opt::Query {
+            inventory,
+            services,
+            regions,
+            text,
+        } => {
+            aws_inventory_sdk::query::query_resources(&inventory, &services, &regions, text)?;
+        }
+        Opt::Serve {
+            inventory,
+            listen,
+            no_browser,
+        } => {
+            let listen_addr = listen.clone();
+            server::start_server(inventory, listen_addr, no_browser).await?;
+        }
     }
 
     Ok(())

@@ -1,67 +1,74 @@
 use anyhow::Result;
 use axum::{
-    extract::{Path, State},
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::get,
     Router,
 };
-use rusqlite::Connection;
+use serde::Deserialize;
 use tower_http::services::ServeDir;
-use serde::Serialize;
-use serde_json::Value;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::{path::PathBuf, sync::Arc};
+
+use crate::query;
 
 #[derive(Clone)]
 struct AppState {
-    db: Arc<Mutex<Connection>>,
+    db_path: Arc<PathBuf>,
 }
 
-#[derive(Serialize)]
-struct BucketSummary {
-    name: String,
-    region: String,
-    details: Value,
+#[derive(Deserialize, Debug)]
+pub struct ApiQueryParams {
+    #[serde(default, deserialize_with = "deserialize_vec_from_str")]
+    services: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_vec_from_str")]
+    regions: Vec<String>,
 }
 
-pub async fn start_server(db_path: PathBuf, listen_addr: String) -> Result<()> {
+fn deserialize_vec_from_str<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.is_empty() {
+        Ok(vec![])
+    } else {
+        Ok(s.split(',').map(|s| s.trim().to_string()).collect())
+    }
+}
+
+pub async fn start_server(db_path: PathBuf, listen_addr: String, no_browser: bool) -> Result<()> {
     let state = AppState {
-        db: Arc::new(Mutex::new(Connection::open(db_path)?)),
+        db_path: Arc::new(db_path),
     };
 
     let app = Router::new()
-        .route("/api/s3_buckets", get(get_s3_buckets))
+        .route("/api/query", get(query_handler))
         .nest_service("/", ServeDir::new("static"))
         .with_state(state);
 
-    println!("Starting server, listening on http://{}", listen_addr);
+    let server_url = format!("http://{}", listen_addr);
+    println!("Starting server, listening on {}", server_url);
+
+    if !no_browser {
+        if let Err(e) = webbrowser::open(&server_url) {
+            eprintln!("Warning: could not open browser: {}", e);
+        }
+    }
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-async fn get_s3_buckets(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = state.db.lock().unwrap();
-    let mut stmt = match conn.prepare("SELECT name, region, details FROM resources WHERE resource_type = 's3:bucket' ORDER BY name") {
-        Ok(stmt) => stmt,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-
-    let bucket_iter = match stmt.query_map([], |row| {
-        let details_str: String = row.get(2)?;
-        let details: Value = serde_json::from_str(&details_str).unwrap_or_default();
-        Ok(BucketSummary {
-            name: row.get(0)?,
-            region: row.get(1)?,
-            details,
-        })
-    }) {
-        Ok(iter) => iter,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-
-    let buckets: Vec<BucketSummary> = bucket_iter.filter_map(Result::ok).collect();
-    Json(buckets).into_response()
+async fn query_handler(
+    State(state): State<AppState>,
+    Query(params): Query<ApiQueryParams>,
+) -> impl IntoResponse {
+    let db_path = Arc::clone(&state.db_path);
+    match tokio::task::spawn_blocking(move || query::run_query(&db_path, &params.services, &params.regions)).await {
+        Ok(Ok(resources)) => (StatusCode::OK, Json(resources)).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }

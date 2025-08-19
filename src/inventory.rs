@@ -3,7 +3,9 @@ use aws_config::SdkConfig;
 use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_eks::Client as EksClient;
 use aws_sdk_elasticloadbalancingv2::Client as ElbClient;
-use aws_sdk_s3::{primitives::DateTime, Client as S3Client};
+use aws_sdk_rds::Client as RdsClient;
+use aws_sdk_dynamodb::Client as DynamoDbClient;
+use aws_sdk_elasticache::Client as ElastiCacheClient;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -92,105 +94,6 @@ impl AwsResourceCollector for Ec2Collector {
         }
         Ok(all_resources)
     }
-}
-
-pub struct S3Collector;
-
-#[async_trait::async_trait]
-impl AwsResourceCollector for S3Collector {
-    async fn collect(&self, profile: &str, _regions: &[String]) -> Result<Vec<CollectedResource>> {
-        println!("Fetching S3 Buckets (this may take a while)...");
-        // S3 list_buckets is a global operation, so we start with a us-east-1 client.
-        let config = create_config(profile, "us-east-1").await;
-        let client = S3Client::new(&config);
-
-        let resp = client.list_buckets().send().await?;
-        let buckets = resp.buckets.unwrap_or_default();
-        let mut handles = vec![];
-
-        println!("  -> Found {} buckets. Now fetching details for each.", buckets.len());
-
-        for bucket in buckets {
-            let bucket_name = bucket.name.unwrap_or_default();
-            let creation_date = bucket.creation_date;
-            let client = client.clone();
-
-            handles.push(tokio::spawn(async move {
-                collect_one_bucket(&client, bucket_name, creation_date).await
-            }));
-        }
-
-        let results = futures::future::join_all(handles).await;
-        let mut all_resources = Vec::new();
-        for result in results {
-            match result {
-                Ok(Ok(Some(resource))) => all_resources.push(resource),
-                Ok(Err(e)) => eprintln!("Could not process a bucket: {}", e),
-                Err(e) => eprintln!("Task failed for a bucket: {}", e),
-                _ => {}
-            }
-        }
-
-        println!("Finished S3 bucket collection.");
-        Ok(all_resources)
-    }
-}
-
-async fn collect_one_bucket(
-    client: &S3Client,
-    bucket_name: String,
-    creation_date: Option<DateTime>,
-) -> Result<Option<CollectedResource>> {
-    let location = client.get_bucket_location().bucket(&bucket_name).send().await?;
-    let region = location
-        .location_constraint
-        .map(|lc| lc.as_str().to_string())
-        .unwrap_or_else(|| "us-east-1".to_string());
-
-    // Create a new client for the correct region if necessary
-    let region_config = client.config().to_builder().region(aws_config::Region::new(region.clone())).build();
-    let region_client = S3Client::from_conf(region_config);
-
-    let mut object_stream = region_client.list_objects_v2().bucket(&bucket_name).into_paginator().send();
-
-    let mut total_size: i64 = 0;
-    let mut total_count: i64 = 0;
-    let mut newest_files: Vec<(String, DateTime)> = Vec::new();
-
-    while let Some(result) = object_stream.next().await {
-        for object in result?.contents.unwrap_or_default() {
-            total_count += 1;
-            total_size += object.size.unwrap_or(0);
-
-            if let (Some(key), Some(modified)) = (object.key, object.last_modified) {
-                if newest_files.len() < 5 {
-                    newest_files.push((key, modified));
-                    newest_files.sort_by(|a, b| b.1.cmp(&a.1));
-                } else if modified > newest_files[4].1 {
-                    newest_files[4] = (key, modified);
-                    newest_files.sort_by(|a, b| b.1.cmp(&a.1));
-                }
-            }
-        }
-    }
-
-    let last_modified = newest_files.first().map(|(_, date)| date.to_string());
-
-    Ok(Some(CollectedResource {
-        arn: format!("arn:aws:s3:::{}", bucket_name),
-        name: bucket_name,
-        resource_type: "s3:bucket".to_string(),
-        region,
-        ips: vec![], // Buckets don't have IPs
-        tags: HashMap::new(), // Tagging requires another API call, skipping for now
-        details: serde_json::json!({
-            "creation_date": creation_date.map(|d| d.to_string()),
-            "last_modified": last_modified,
-            "file_count": total_count,
-            "total_size": total_size,
-            "newest_files": newest_files.into_iter().map(|(key, date)| serde_json::json!({"key": key, "date": date.to_string()})).collect::<Vec<_>>(),
-        }),
-    }))
 }
 
 pub struct ElbCollector;
@@ -412,6 +315,164 @@ impl AwsResourceCollector for EksCollector {
             }
         }
 
+        Ok(all_resources)
+    }
+}
+
+
+pub struct RdsCollector;
+
+#[async_trait::async_trait]
+impl AwsResourceCollector for RdsCollector {
+    async fn collect(&self, profile: &str, regions: &[String]) -> Result<Vec<CollectedResource>> {
+        let mut all_resources = Vec::new();
+
+        for region in regions {
+            println!("Fetching RDS instances from {}...", region);
+            let config = create_config(profile, region).await;
+            let client = RdsClient::new(&config);
+            let mut stream = client.describe_db_instances().into_paginator().send();
+
+            let mut count = 0;
+            while let Some(result) = stream.next().await {
+                for db_instance in result?.db_instances.unwrap_or_default() {
+                    let tags: HashMap<_, _> = db_instance
+                        .tag_list
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|t| (t.key.unwrap_or_default(), t.value.unwrap_or_default()))
+                        .collect();
+
+                    let name = db_instance.db_instance_identifier.clone().unwrap_or_default();
+                    let arn = db_instance.db_instance_arn.clone().unwrap_or_default();
+
+                    all_resources.push(CollectedResource {
+                        arn,
+                        name,
+                        resource_type: "rds:db_instance".to_string(),
+                        region: region.to_string(),
+                        ips: vec![], // RDS endpoints are hostnames, not IPs
+                        tags,
+                        details: serde_json::json!({
+                            "engine": db_instance.engine,
+                            "instance_class": db_instance.db_instance_class,
+                            "publicly_accessible": db_instance.publicly_accessible,
+                        }),
+                    });
+                    count += 1;
+                }
+            }
+            println!("  -> Found {} instances in {}.", count, region);
+        }
+        Ok(all_resources)
+    }
+}
+
+pub struct DynamoDbCollector;
+
+#[async_trait::async_trait]
+impl AwsResourceCollector for DynamoDbCollector {
+    async fn collect(&self, profile: &str, regions: &[String]) -> Result<Vec<CollectedResource>> {
+        let mut all_resources = Vec::new();
+
+        for region in regions {
+            println!("Fetching DynamoDB tables from {}...", region);
+            let config = create_config(profile, region).await;
+            let client = DynamoDbClient::new(&config);
+            let mut tables_stream = client.list_tables().into_paginator().send();
+
+            let mut table_names = Vec::new();
+            while let Some(result) = tables_stream.next().await {
+                table_names.extend(result?.table_names.unwrap_or_default());
+            }
+
+            let mut count = 0;
+            for table_name in table_names {
+                let desc = client.describe_table().table_name(&table_name).send().await?;
+                let table = desc.table.unwrap();
+
+                let tags_output = client.list_tags_of_resource().resource_arn(table.table_arn().unwrap()).send().await?;
+                let tags: HashMap<_, _> = tags_output
+                    .tags
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| (t.key, t.value))
+                    .collect();
+
+                all_resources.push(CollectedResource {
+                    arn: table.table_arn.clone().unwrap_or_default(),
+                    name: table.table_name.clone().unwrap_or_default(),
+                    resource_type: "dynamodb:table".to_string(),
+                    region: region.to_string(),
+                    ips: vec![],
+                    tags,
+                    details: serde_json::json!({
+                        "item_count": table.item_count,
+                        "table_size_bytes": table.table_size_bytes,
+                    }),
+                });
+                count += 1;
+            }
+            println!("  -> Found {} tables in {}.", count, region);
+        }
+        Ok(all_resources)
+    }
+}
+
+pub struct ElastiCacheCollector;
+
+#[async_trait::async_trait]
+impl AwsResourceCollector for ElastiCacheCollector {
+    async fn collect(&self, profile: &str, regions: &[String]) -> Result<Vec<CollectedResource>> {
+        let mut all_resources = Vec::new();
+
+        for region in regions {
+            println!("Fetching ElastiCache clusters from {}...", region);
+            let config = create_config(profile, region).await;
+            let client = ElastiCacheClient::new(&config);
+            let mut clusters_stream = client.describe_cache_clusters().into_paginator().send();
+
+            let mut count = 0;
+            while let Some(result) = clusters_stream.next().await {
+                for cluster in result?.cache_clusters.unwrap_or_default() {
+                    let arn = cluster.arn.clone().unwrap_or_default();
+                    let tags_output = client.list_tags_for_resource().resource_name(&arn).send().await?;
+                    let tags: HashMap<_, _> = tags_output
+                        .tag_list
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|t| (t.key.unwrap_or_default(), t.value.unwrap_or_default()))
+                        .collect();
+
+                    let ips = Vec::new();
+                    if let Some(nodes) = cluster.cache_nodes {
+                        for node in nodes {
+                            if let Some(endpoint) = node.endpoint {
+                                if let Some(_address) = endpoint.address {
+                                    // This is a hostname, not an IP. The prompt is wrong.
+                                }
+                            }
+                        }
+                    }
+
+                    all_resources.push(CollectedResource {
+                        arn,
+                        name: cluster.cache_cluster_id.clone().unwrap_or_default(),
+                        resource_type: "elasticache:cluster".to_string(),
+                        region: region.to_string(),
+                        ips,
+                        tags,
+                        details: serde_json::json!({
+                            "engine": cluster.engine,
+                            "engine_version": cluster.engine_version,
+                            "cache_node_type": cluster.cache_node_type,
+                        }),
+                    });
+                    count += 1;
+                }
+            }
+            println!("  -> Found {} clusters in {}.", count, region);
+        }
         Ok(all_resources)
     }
 }

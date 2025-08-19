@@ -4,7 +4,7 @@ A command-line tool for discovering, inventorying, and querying AWS resources ac
 
 ## Features
 
--   **Multi-Service Inventory**: Collects data from EC2, ELB, RDS, EKS, DynamoDB, and more.
+-   **Multi-Service Inventory**: Collects data from EC2, ELB, RDS, EKS, DynamoDB and Elasticache.
 -   **SQLite Backend**: All resource data is stored in a local `aws_inventory.db` file, allowing for complex queries and easy data access.
 -   **Flexible Querying**: A powerful `query` subcommand to filter resources by service and region.
 -   **Multiple Output Formats**: Get query results as pretty-printed JSON or a human-readable text table.

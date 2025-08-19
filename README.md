@@ -47,10 +47,10 @@ cp the binary to each dir and use from there
 
 ```sh
 # Scan all available regions for the specified profile
-./target/release/aws-inventory-sdk inventory --profile your-profile-name --regions all
+./aws-inventory-sdk-macos-arm64 inventory --profile your-profile-name --regions all
 
 # Scan a specific set of regions
-./target/release/aws-inventory-sdk inventory --profile your-profile-name --regions us-east-1,eu-west-1
+./aws-inventory-sdk-macos-arm64 inventory --profile your-profile-name --regions us-east-1,eu-west-1
 ```
 
 This will create an `aws_inventory.db` file in your current directory.
@@ -63,13 +63,13 @@ The `query` subcommand allows you to filter and view the collected data. By defa
 
 ```sh
 # Get all EC2 instances and RDS databases across all scanned regions
-./target/release/aws-inventory-sdk query --services ec2,rds
+./aws-inventory-sdk-macos-arm64 query --services ec2,rds
 
 # Get all EKS pods in the us-east-1 region
-./target/release/aws-inventory-sdk query --services eks --regions us-east-1
+./aws-inventory-sdk-macos-arm64 query --services eks --regions us-east-1
 
 # Get all EC2 instances in a compact, human-readable text format
-./target/release/aws-inventory-sdk query --services ec2 --text
+./aws-inventory-sdk-macos-arm64 query --services ec2 --text
 ```
 
 ### 3. Serve the Web API
@@ -78,10 +78,10 @@ The `serve` command starts a local web server, providing a REST API to your inve
 
 ```sh
 # Start the server (defaults to http://127.0.0.1:8080)
-./target/release/aws-inventory-sdk serve
+./aws-inventory-sdk-macos-arm64 serve
 
 # Start on a different port and don't open the browser
-./target/release/aws-inventory-sdk serve --listen 127.0.0.1:9000 --no-browser
+./aws-inventory-sdk-macos-arm64 serve --listen 127.0.0.1:9000 --no-browser
 ```
 
 Once the server is running, you can query the API.
@@ -101,7 +101,7 @@ curl "http://127.0.0.1:8080/api/query?services=eks&regions=us-east-1"
 Quickly find which resource an IP address belongs to.
 
 ```sh
-./target/release/aws-inventory-sdk identify 10.0.1.5
+./aws-inventory-sdk-macos-arm64 identify 10.0.1.5
 ```
 
 ### 5. Export a Hosts File
@@ -110,8 +110,8 @@ Generate a hosts file that can be used with tools like Wireshark for easy IP-to-
 
 ```sh
 # The output file defaults to hosts.txt
-./target/release/aws-inventory-sdk export-hosts
+./aws-inventory-sdk-macos-arm64 export-hosts
 
 # Specify a different output file
-./target/release/aws-inventory-sdk export-hosts --output /path/to/my-hosts.txt
+./aws-inventory-sdk-macos-arm64 export-hosts --output /path/to/my-hosts.txt
 ```

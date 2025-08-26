@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
             no_eks,
             eks_clusters,
         } => {
-            let regions_to_scan = if regions.contains(&"all".to_string()) {
+            let regions_to_scan = if regions.iter().any(|r| r == "all") {
                 config::get_available_regions()
                     .iter()
                     .map(|s| s.to_string())

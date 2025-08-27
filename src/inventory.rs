@@ -6,11 +6,20 @@ use aws_sdk_elasticloadbalancingv2::Client as ElbClient;
 use aws_sdk_rds::Client as RdsClient;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
 use aws_sdk_elasticache::Client as ElastiCacheClient;
-use serde::Deserialize;
+use aws_sdk_route53::Client as Route53Client;
+use aws_sdk_route53::types::TagResourceType as Route53ResourceType;
+use k8s_openapi::api::core::v1::Pod;
+use kube::{
+    api::{Api, ListParams, ResourceExt},
+    Client,
+    config::{
+        AuthInfo, Cluster, Context, ExecConfig, Kubeconfig, KubeConfigOptions, NamedAuthInfo,
+        NamedCluster, NamedContext,
+    },
+};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::process::Command;
 
 /// A standardized representation of a resource to be stored.
 #[derive(Debug)]
@@ -92,6 +101,76 @@ impl AwsResourceCollector for Ec2Collector {
             }
             println!("  -> Found {} instances in {}.", count, region);
         }
+        Ok(all_resources)
+    }
+}
+
+pub struct Route53Collector;
+
+#[async_trait::async_trait]
+impl AwsResourceCollector for Route53Collector {
+    async fn collect(&self, profile: &str, _regions: &[String]) -> Result<Vec<CollectedResource>> {
+        // Route 53 is a global service, so we query it once, ignoring the regions list.
+        // We use "us-east-1" for the client, as is standard for global services.
+        println!("\nFetching Route 53 hosted zones (global service)...");
+        let config = create_config(profile, "us-east-1").await;
+        let client = Route53Client::new(&config);
+        let mut all_resources = Vec::new();
+        let mut zones_stream = client.list_hosted_zones().into_paginator().send();
+
+        let mut count = 0;
+        while let Some(result) = zones_stream.next().await {
+            for zone in result?.hosted_zones {
+                let zone_id = zone.id();
+                let resource_id = zone_id.split('/').last().unwrap_or_default();
+
+                let tags = if !resource_id.is_empty() {
+                    match client
+                        .list_tags_for_resource()
+                        .resource_type(Route53ResourceType::Hostedzone)
+                        .resource_id(resource_id)
+                        .send()
+                        .await
+                    {
+                        Ok(tags_output) => tags_output
+                            .resource_tag_set
+                            .and_then(|rts| rts.tags)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|t| Some((t.key()?.to_string(), t.value()?.to_string())))
+                            .collect(),
+                        Err(e) => {
+                            eprintln!("Could not get tags for Route53 zone {}: {}", zone_id, e);
+                            HashMap::new()
+                        }
+                    }
+                } else {
+                    HashMap::new()
+                };
+
+                let (is_private, rr_count) = if let Some(ref config) = zone.config {
+                    (config.private_zone, zone.resource_record_set_count.unwrap_or(0))
+                } else {
+                    (false, 0)
+                };
+
+                all_resources.push(CollectedResource {
+                    arn: zone_id.to_string(),
+                    name: zone.name().to_string(),
+                    resource_type: "route53:hostedzone".to_string(),
+                    region: "global".to_string(),
+                    ips: vec![],
+                    tags,
+                    details: serde_json::json!({
+                        "private_zone": is_private,
+                        "resource_record_set_count": rr_count,
+                    }),
+                });
+                count += 1;
+            }
+        }
+        println!("  -> Found {} hosted zones.", count);
+
         Ok(all_resources)
     }
 }
@@ -189,40 +268,14 @@ impl AwsResourceCollector for ElbCollector {
     }
 }
 
-#[derive(Deserialize, Debug)]
-struct KubePodList {
-    items: Vec<KubePod>,
-}
-
-#[derive(Deserialize, Debug)]
-struct KubePod {
-    metadata: KubeMetadata,
-    status: KubeStatus,
-}
-
-#[derive(Deserialize, Debug)]
-struct KubeMetadata {
-    name: String,
-    namespace: String,
-    labels: Option<HashMap<String, String>>,
-}
-
-#[derive(Deserialize, Debug)]
-struct KubeStatus {
-    #[serde(rename = "podIP")]
-    pod_ip: Option<String>,
-}
-
 pub struct EksCollector {
     clusters_to_scan: Vec<String>,
-    skip_eks: bool,
 }
 
 impl EksCollector {
-    pub fn new(clusters_to_scan: Vec<String>, skip_eks: bool) -> Self {
+    pub fn new(clusters_to_scan: Vec<String>) -> Self {
         Self {
             clusters_to_scan,
-            skip_eks,
         }
     }
 }
@@ -230,84 +283,146 @@ impl EksCollector {
 #[async_trait::async_trait]
 impl AwsResourceCollector for EksCollector {
     async fn collect(&self, profile: &str, regions: &[String]) -> Result<Vec<CollectedResource>> {
-        if self.skip_eks {
-            println!("\nSkipping EKS pod inventory as requested.");
-            return Ok(vec![]);
-        }
-
         let mut all_resources = Vec::new();
 
         for region in regions {
-            let clusters_to_process = if !self.clusters_to_scan.is_empty() {
-                self.clusters_to_scan.clone()
-            } else {
+            let config = create_config(profile, region).await;
+            let eks_client = EksClient::new(&config);
+
+            let clusters_to_process = if self.clusters_to_scan.is_empty() {
                 println!("Discovering EKS clusters in {}...", region);
-                let config = create_config(profile, region).await;
-                let client = EksClient::new(&config);
-                let mut cluster_stream = client.list_clusters().into_paginator().send();
+                let mut cluster_stream = eks_client.list_clusters().into_paginator().send();
                 let mut discovered_clusters = Vec::new();
                 while let Some(result) = cluster_stream.next().await {
                     discovered_clusters.extend(result?.clusters.unwrap_or_default());
                 }
                 println!("  -> Found {} clusters in {}.", discovered_clusters.len(), region);
                 discovered_clusters
+            } else {
+                self.clusters_to_scan.clone()
             };
 
             for cluster_name in &clusters_to_process {
-                println!("Updating kubeconfig for cluster '{}'...", cluster_name);
-                let mut cmd = Command::new("aws");
-                cmd.arg("eks")
-                    .arg("update-kubeconfig")
-                    .arg("--region")
-                    .arg(region)
-                    .arg("--name")
-                    .arg(cluster_name);
-                if !profile.is_empty() {
-                    cmd.arg("--profile").arg(profile);
-                }
+                println!("Connecting to EKS cluster '{}'...", cluster_name);
 
-                let output = cmd.output()?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if !self.clusters_to_scan.is_empty() && stderr.contains("ResourceNotFoundException") {
+                let cluster_desc = match eks_client.describe_cluster().name(cluster_name).send().await {
+                    Ok(res) => res.cluster.unwrap(),
+                    Err(aws_sdk_eks::error::SdkError::ServiceError(service_error)) => {
+                        let inner_err = service_error.into_err();
+                        if !self.clusters_to_scan.is_empty() {
+                            if inner_err.is_resource_not_found_exception() {
+                                println!("  -> Cluster '{}' not found in region {}, skipping.", cluster_name, region);
+                                continue;
+                            }
+                        }
+                        eprintln!("Failed to describe cluster '{}': {}", cluster_name, inner_err);
                         continue;
                     }
-                    eprintln!("Failed to update kubeconfig for cluster '{}': {}", cluster_name, stderr);
+                    Err(e) => {
+                        eprintln!("Failed to describe cluster '{}': {}", cluster_name, e);
+                        continue;
+                    }
+                };
+
+                let Some(api_endpoint) = cluster_desc.endpoint else {
+                    eprintln!("Cluster '{}' has no endpoint.", cluster_name);
                     continue;
+                };
+                let Some(ca_data) = cluster_desc.certificate_authority.and_then(|ca| ca.data) else {
+                    eprintln!("Cluster '{}' has no certificate authority data.", cluster_name);
+                    continue;
+                };
+
+                let mut exec_args = vec![
+                    "eks".to_string(),
+                    "get-token".to_string(),
+                    "--cluster-name".to_string(),
+                    cluster_name.clone(),
+                    "--region".to_string(),
+                    region.to_string(),
+                ];
+                if !profile.is_empty() {
+                    exec_args.push("--profile".to_string());
+                    exec_args.push(profile.to_string());
                 }
+                let exec_config = ExecConfig {
+                    command: Some("aws".to_string()),
+                    args: Some(exec_args),
+                    api_version: Some("client.authentication.k8s.io/v1beta1".to_string()),
+                    env: None,
+                    cluster: None,
+                    drop_env: None,
+                    interactive_mode: None,
+                    provide_cluster_info: false,
+                };
+                
+                let kubeconfig = Kubeconfig {
+                    clusters: vec![NamedCluster {
+                        name: cluster_name.clone(),
+                        cluster: Some(Cluster {
+                            server: Some(api_endpoint),
+                            certificate_authority_data: Some(ca_data),
+                            ..Default::default()
+                        }),
+                    }],
+                    auth_infos: vec![NamedAuthInfo {
+                        name: "eks-auth".to_string(),
+                        auth_info: Some(AuthInfo {
+                            exec: Some(exec_config),
+                            ..Default::default()
+                        }),
+                    }],
+                    contexts: vec![NamedContext {
+                        name: "eks-context".to_string(),
+                        context: Some(Context {
+                            cluster: cluster_name.clone(),
+                            user: "eks-auth".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    current_context: Some("eks-context".to_string()),
+                    ..Default::default()
+                };
+
+                let config = kube::Config::from_custom_kubeconfig(kubeconfig, &KubeConfigOptions::default()).await
+                    .map_err(|e| anyhow::anyhow!("Failed to create kubeconfig for cluster '{}': {}", cluster_name, e))?;
+                let client = Client::try_from(config)
+                    .map_err(|e| anyhow::anyhow!("Failed to create Kubernetes client for cluster '{}'. This may happen if the 'aws' CLI is not in your PATH or not authenticated. Error: {}", cluster_name, e))?;
 
                 println!("Fetching pods from cluster '{}'...", cluster_name);
-                let mut cmd = Command::new("kubectl");
-                cmd.arg("get").arg("pods").arg("--all-namespaces").arg("-o").arg("json");
+                let pods: Api<Pod> = Api::all(client);
+                let pod_list = match pods.list(&ListParams::default()).await {
+                    Ok(pl) => pl,
+                    Err(e) => {
+                        eprintln!("Error fetching pods from cluster '{}': {}", cluster_name, e);
+                        continue;
+                    }
+                };
 
-                let output = cmd.output()?;
-                if !output.status.success() {
-                    eprintln!("Error running kubectl for cluster '{}': {}", cluster_name, String::from_utf8_lossy(&output.stderr));
-                    continue;
-                }
-
-                let pod_list: KubePodList = serde_json::from_slice(&output.stdout)?;
                 let mut count = 0;
-                for pod in pod_list.items {
-                    if let Some(ip_str) = pod.status.pod_ip {
-                        if let Ok(ip) = ip_str.parse() {
-                            let name = pod.metadata.name;
-                            let namespace = pod.metadata.namespace;
-                            let arn = format!("{}/{}/{}/{}", region, cluster_name, namespace, name);
+                for pod in pod_list {
+                    if let Some(ref status) = pod.status {
+                        if let Some(ip_str) = &status.pod_ip {
+                            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                                let name = pod.name_any();
+                                let namespace = pod.namespace().unwrap_or_default();
+                                let arn = format!("{}/{}/{}/{}", region, cluster_name, &namespace, &name);
+                                let tags: HashMap<_, _> = pod.metadata.labels.unwrap_or_default().into_iter().collect();
 
-                            all_resources.push(CollectedResource {
-                                arn,
-                                name,
-                                resource_type: "eks:pod".to_string(),
-                                region: region.to_string(),
-                                ips: vec![ip],
-                                tags: pod.metadata.labels.unwrap_or_default(),
-                                details: serde_json::json!({
-                                    "cluster": cluster_name,
-                                    "namespace": namespace,
-                                }),
-                            });
-                            count += 1;
+                                all_resources.push(CollectedResource {
+                                    arn,
+                                    name,
+                                    resource_type: "eks:pod".to_string(),
+                                    region: region.to_string(),
+                                    ips: vec![ip],
+                                    tags, // Using K8s labels as AWS tags for consistency
+                                    details: serde_json::json!({
+                                        "cluster": cluster_name.clone(),
+                                        "namespace": namespace,
+                                    }),
+                                });
+                                count += 1;
+                            }
                         }
                     }
                 }

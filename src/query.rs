@@ -111,6 +111,7 @@ fn map_service_name(short_name: &str) -> String {
         "ec2" => "ec2:instance",
         "elb" => "elbv2:loadbalancer",
         "eks" => "eks:pod",
+        "route53" => "route53:hostedzone",
         
         _ => short_name, // If not a short name, assume it's a full resource_type
     }.to_string()

@@ -3,6 +3,13 @@ name = "aws-inventory-sdk"
 version = "0.1.0"
 edition = "2021"
 
+[profile.release]
+opt-level = 'z'     # Optimize for size.
+lto = true          # Enable Link-Time Optimization.
+codegen-units = 1   # Reduce number of codegen units to increase optimizations.
+panic = 'abort'     # Abort on panic instead of unwinding.
+strip = true        # Automatically strip symbols from the binary.
+
 [dependencies]
 aws-config = "1.8.5"
 aws-sdk-ec2 = "1.159.0"

@@ -37,12 +37,14 @@ All commands are run via the `aws-inventory-sdk` binary.
 
 ### 1. Create the Inventory Database
 
-First, you need to populate the local database with your AWS resource data.
+The `inventory` subcommand scans your AWS account and populates the local database. By default, running the command without service flags will only collect **EC2 instance** data.
+
 It is recommended to have a directory for each profile so it uses a separate db
 
 ```sh
 mkdir -p ~/inv/{dev,qa,prod}
-cp the binary to each dir and use from there
+cp dist/aws-inventory-sdk-* ~/inv/dev/
+cd ~/inv/dev
 ```
 
 ```sh
@@ -51,6 +53,9 @@ cp the binary to each dir and use from there
 
 # Scan a specific set of regions
 ./aws-inventory-sdk-macos-arm64 inventory --profile symphony-aws-c9-dev --regions us-east-1,eu-central-1
+
+# Scan a specific set of services
+./aws-inventory-sdk-macos-arm64 inventory --profile symphony-aws-c9-dev --regions us-east-1 --services ec2,elb
 ```
 
 This will create an `aws_inventory.db` file in your current directory.

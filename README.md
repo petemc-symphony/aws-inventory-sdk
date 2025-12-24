@@ -47,10 +47,10 @@ cp the binary to each dir and use from there
 
 ```sh
 # Scan all available regions for the specified profile
-./aws-inventory-sdk-macos-arm64 inventory --profile symphony-aws-c9-dev --regions all
+./aws-inventory-sdk-macos-arm64 inventory --profile <profile_name> --regions all
 
 # Scan a specific set of regions
-./aws-inventory-sdk-macos-arm64 inventory --profile symphony-aws-c9-dev --regions us-east-1,eu-central-1
+./aws-inventory-sdk-macos-arm64 inventory --profile <profile_name> --regions us-east-1,eu-central-1
 ```
 
 This will create an `aws_inventory.db` file in your current directory.
